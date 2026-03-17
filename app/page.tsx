@@ -208,6 +208,12 @@ export default function ContraPage() {
         guestInputLoggedRef.current = false;
         hostInputLoggedRef.current = false;
 
+        // Request focus so keyboard events work in iframe
+        try { window.focus(); } catch { /* ignore */ }
+        setTimeout(() => {
+            try { window.focus(); canvasRef.current?.focus(); } catch { /* ignore */ }
+        }, 100);
+
         if (roleRef.current === 'host') {
             // Host: initialize game state and start game loop
             const ids = playerIdsRef.current.length >= 2
@@ -215,6 +221,13 @@ export default function ContraPage() {
                 : [myIdRef.current, 'guest'];
             console.log(`[CONTRA] Starting game as HOST with players: ${ids.join(', ')}`);
             gameStateRef.current = initState(ids);
+
+            // Debug: verify game state
+            const ps = Object.entries(gameStateRef.current.players);
+            console.log(`[CONTRA] Game state initialized: ${ps.length} players, phase=${gameStateRef.current.phase}`);
+            for (const [id, p] of ps) {
+                console.log(`[CONTRA]   Player ${id}: hp=${p.hp}, alive=${p.alive}, pos=(${p.x},${p.y})`);
+            }
 
             // Send initial player IDs to guest
             rtcRef.current?.send({ type: 'init', playerIds: ids });
@@ -251,6 +264,8 @@ export default function ContraPage() {
 
     // ─── Host Game Loop ───────────────────────────────────────────────
 
+    const hostTickCountRef = useRef(0);
+
     const hostTick = useCallback(() => {
         if (!gameStateRef.current || roleRef.current !== 'host') return;
 
@@ -264,6 +279,14 @@ export default function ContraPage() {
         // Advance simulation
         tick(gameStateRef.current, dt);
 
+        // Log phase transitions
+        hostTickCountRef.current++;
+        if (hostTickCountRef.current <= 5) {
+            const gs = gameStateRef.current;
+            const playerSummary = Object.values(gs.players).map(p => `${p.id.slice(0,6)}:hp=${p.hp},alive=${p.alive}`).join(' | ');
+            console.log(`[CONTRA] Tick #${hostTickCountRef.current}: phase=${gs.phase}, enemies=${gs.enemies.length}, score=${gs.score} | ${playerSummary}`);
+        }
+
         // Broadcast state to guest
         const ns = toNetworkState(gameStateRef.current);
         networkStateRef.current = ns;
@@ -271,11 +294,12 @@ export default function ContraPage() {
 
         // Check game over
         if (isTerminal(gameStateRef.current)) {
-            console.log(`[CONTRA] Game over! Score: ${gameStateRef.current.score}, Wave: ${gameStateRef.current.wave}`);
+            const gs = gameStateRef.current;
+            const playerSummary = Object.values(gs.players).map(p => `${p.id.slice(0,6)}:hp=${p.hp},alive=${p.alive}`).join(' | ');
+            console.log(`[CONTRA] Game over! Score: ${gs.score}, Wave: ${gs.wave}, Players: ${playerSummary}`);
             if (tickHandleRef.current) clearInterval(tickHandleRef.current);
             tickHandleRef.current = null;
-            // Send final state + game_over event
-            rtcRef.current?.send({ type: 'game_over', score: gameStateRef.current.score, wave: gameStateRef.current.wave });
+            rtcRef.current?.send({ type: 'game_over', score: gs.score, wave: gs.wave });
             setPhase('gameover');
         }
     }, []);
@@ -305,6 +329,12 @@ export default function ContraPage() {
         } else {
             // Guest receives game state from host
             if (msg.type === 'state') {
+                // Log first state and phase changes
+                if (!networkStateRef.current) {
+                    console.log(`[CONTRA] Guest received first state: phase=${msg.phase}, players=${Object.keys(msg.players || {}).length}`);
+                } else if (networkStateRef.current.phase !== msg.phase) {
+                    console.log(`[CONTRA] Guest phase change: ${networkStateRef.current.phase} → ${msg.phase}`);
+                }
                 networkStateRef.current = msg;
                 // Detect game over from state
                 if (msg.phase === 'game_over') {
@@ -387,11 +417,16 @@ export default function ContraPage() {
             KeyZ: 'fire', KeyJ: 'fire', Enter: 'fire',
         };
 
+        let keyLogCount = 0;
         const onKey = (e: KeyboardEvent, down: boolean) => {
             const mapped = keyMap[e.code];
             if (mapped) {
                 e.preventDefault();
                 keysRef.current[mapped] = down;
+                if (down && keyLogCount < 3) {
+                    console.log(`[CONTRA] Key: ${e.code} → ${mapped}`);
+                    keyLogCount++;
+                }
             }
         };
 
@@ -488,7 +523,8 @@ export default function ContraPage() {
         }}>
             <canvas
                 ref={canvasRef}
-                style={{ display: 'block', width: '100%', height: '100%' }}
+                tabIndex={0}
+                style={{ display: 'block', width: '100%', height: '100%', outline: 'none' }}
             />
 
             {/* Status overlay (loading/waiting/connecting) */}
