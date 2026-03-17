@@ -252,6 +252,83 @@ db.services.insertOne({
 
 Note: `connection_mode: "platform"` because signaling goes through Usion's Socket.IO. The P2P WebRTC connection is established client-side — the backend just relays the initial handshake.
 
+## Lessons Learned / Common Pitfalls
+
+Hard-won debugging lessons from building this P2P reference game. If you're adapting this for your own game, read these first.
+
+### 1. Signal Race Condition (Critical)
+
+**Problem:** Host sends WebRTC offer before guest registers its `onRealtime` handler → offer is silently dropped → connection never establishes.
+
+**Why it happens:** When the guest calls `game.join()`, the backend processes the join and immediately notifies the host via `game:player_joined`. The host then sends the SDP offer. But the guest's `.then()` callback (where `setupP2PConnection` registers the signal handler) hasn't run yet — JavaScript is single-threaded and the promise resolution is queued.
+
+**Fix — three layers of defense:**
+
+1. **Early signal buffer:** Register `game.onRealtime()` BEFORE calling `game.connect()`/`game.join()`. Buffer any signals that arrive before `setupP2PConnection` is called:
+   ```typescript
+   // In page.tsx — register BEFORE game.connect()
+   usion.game.onRealtime((data) => {
+       if (signalDispatcher) signalDispatcher(data);
+       else if (data?.action_type === 'signal') earlyBuffer.push(data);
+   });
+   ```
+
+2. **`guest_ready` handshake:** Guest sends a `guest_ready` signal; host waits for it before creating the offer. This guarantees the guest's handler is registered.
+
+3. **Internal signal buffer in `waitForSignal`:** Checks the buffer first — if the signal already arrived, resolve immediately instead of waiting.
+
+**Important:** Usion's `game.onRealtime()` is a **SETTER** (overwrites previous handler), not an event emitter. The `signalSubscribe` pattern in `signaling.ts` lets page.tsx own the single handler and dispatch to subscribers.
+
+### 2. Passive Touch Event Listeners in Iframes
+
+**Problem:** `Unable to preventDefault inside passive event listener invocation` errors. Touch events don't work properly — the game scrolls/bounces instead of capturing input.
+
+**Why:** React registers touch handlers as passive by default (per browser spec). Inside an iframe, you need `preventDefault()` to stop the parent page from scrolling.
+
+**Fix:** Use native `addEventListener` with `{ passive: false }` instead of React's `onTouchStart`/`onTouchMove`:
+```typescript
+canvas.addEventListener('touchstart', handler, { passive: false });
+canvas.addEventListener('touchmove', handler, { passive: false });
+// Clean up in useEffect return
+```
+
+### 3. Iframe Keyboard Focus
+
+**Problem:** Keyboard input (WASD, arrow keys) doesn't work when the game loads inside an iframe.
+
+**Why:** The iframe doesn't have focus by default. `window.addEventListener('keydown')` only fires when the iframe's window is focused.
+
+**Fix:**
+- Call `window.focus()` when the game starts
+- Set `tabIndex={0}` on the canvas element
+- Call `canvasRef.current?.focus()` when transitioning to the playing phase
+- The user may need to tap/click inside the game once on some browsers
+
+### 4. Overlay Divs Blocking Touch on Mobile
+
+**Problem:** Game over screen or HUD overlays capture all touch events, making the game unplayable underneath.
+
+**Fix:** Use `pointerEvents: 'none'` on overlay containers that shouldn't capture touch, and only enable `pointerEvents: 'auto'` on interactive elements (buttons) within the overlay.
+
+### 5. rtcRef Timing with Async setupP2PConnection
+
+**Problem:** Guest starts sending input immediately when P2P connects, but `rtcRef.current` might still be null — `setupP2PConnection` is `async` and the WebRTC `onconnectionstatechange` can fire (setting state to 'connected') before the function resolves and returns the `WebRTCManager`.
+
+**Fix:** Set `rtcRef.current = rtc` inside the `onState` callback as early as possible, in addition to setting it from the resolved promise. Start the guest input sender inside the connection callback, not in a React `useEffect` dependent on phase state.
+
+### 6. Guest Input Sender Timing
+
+**Problem:** Guest's input sender `useEffect` with `[phase]` dependency fires unreliably — sometimes too early (before P2P connects), sometimes too late, sometimes not at all due to React batching.
+
+**Fix:** Start the input `setInterval` directly inside `startGameSession()` when the P2P connection is confirmed, rather than relying on React effect lifecycle:
+```typescript
+if (role === 'guest') {
+    inputSenderInterval = setInterval(() => {
+        if (rtc?.connected) rtc.send({ type: 'input', keys: {...keysRef.current} });
+    }, TICK_MS);
+}
+```
+
 ## License
 
 MIT
