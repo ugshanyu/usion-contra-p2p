@@ -230,9 +230,15 @@ export default function ContraPage() {
         if (roleRef.current === 'host') {
             // Host receives guest's input
             if (msg.type === 'input') {
-                const guestId = playerIdsRef.current.find(id => id !== myIdRef.current) || 'guest';
                 if (gameStateRef.current) {
-                    applyInput(gameStateRef.current, guestId, msg.keys);
+                    // Find the guest player in game state (not playerIdsRef,
+                    // which may have the real ID while state uses fallback 'guest')
+                    const guestId = Object.keys(gameStateRef.current.players).find(
+                        id => id !== myIdRef.current
+                    );
+                    if (guestId) {
+                        applyInput(gameStateRef.current, guestId, msg.keys);
+                    }
                 }
             }
         } else {
