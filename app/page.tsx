@@ -99,24 +99,27 @@ export default function ContraPage() {
                         ? 'Waiting for player 2 to join...'
                         : 'Connecting to host...');
 
-                    // Listen for opponent joining
+                    // Listen for opponent joining the socket room
                     usion.game.onPlayerJoined((data: any) => {
-                        // Update player list from event
                         if (data?.player_ids) {
                             playerIdsRef.current = data.player_ids;
                         }
-                        // If we didn't have hostId before, try from event
                         if (!hostId && data?.host_id) {
                             const eventIsHost = userId === data.host_id;
                             roleRef.current = eventIsHost ? 'host' : 'guest';
                             console.log(`[CONTRA] Role updated from event: ${roleRef.current}`);
                         }
-                        console.log('[CONTRA] Player joined, starting P2P connection');
+                        console.log('[CONTRA] Player joined socket room, starting P2P');
                         startP2PConnection();
                     });
 
-                    // If both players already in room, start immediately
-                    if (playerIdsRef.current.length >= 2) {
+                    // Only start P2P if the other player is ALREADY connected
+                    // to the socket room (connected_count reflects live sockets,
+                    // not just MongoDB membership). This avoids sending an offer
+                    // before the guest has joined the socket room to receive it.
+                    const connectedCount = joinData?.connected_count || 0;
+                    console.log(`[CONTRA] Connected count: ${connectedCount}`);
+                    if (connectedCount >= 2) {
                         startP2PConnection();
                     }
                 })
