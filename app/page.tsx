@@ -45,6 +45,7 @@ export default function ContraPage() {
         left: false, right: false, up: false, down: false, jump: false, fire: false,
     });
     const connectionInfoRef = useRef({ transport: 'P2P', rttMs: 0 });
+    const p2pStartedRef = useRef(false);
     const tickHandleRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const rafRef = useRef<number>(0);
     const lastTickRef = useRef<number>(0);
@@ -61,35 +62,61 @@ export default function ContraPage() {
         usion.init((config: any) => {
             const userId = usion.user?.getId?.() || config.userId || 'unknown';
             const roomId = config.roomId;
-            const hostId = config.hostId || config.host_id;
-            const playerIds = config.playerIds || config.player_ids || [];
+            const initHostId = config.hostId || config.host_id;
+            const initPlayerIds = config.playerIds || config.player_ids || [];
 
             myIdRef.current = userId;
-            playerIdsRef.current = playerIds;
+            playerIdsRef.current = initPlayerIds;
 
-            // Determine role: room creator is host
-            const isHost = userId === hostId;
-            roleRef.current = isHost ? 'host' : 'guest';
-
-            console.log(`[CONTRA] Role: ${roleRef.current}, userId: ${userId}, hostId: ${hostId}`);
+            console.log(`[CONTRA] Init: userId=${userId}, hostId=${initHostId}, players=${initPlayerIds.length}`);
 
             setPhase('waiting');
-            setStatusText(isHost
-                ? 'Waiting for player 2 to join...'
-                : 'Connecting to host...');
+            setStatusText('Connecting...');
 
             // Connect to platform (Socket.IO) for signaling
             usion.game.connect()
                 .then(() => usion.game.join(roomId))
-                .then(() => {
+                .then((joinData: any) => {
+                    // Get host_id from join response (backend sends it)
+                    // Fall back to INIT config hostId
+                    const hostId = joinData?.host_id || initHostId;
+                    const joinPlayerIds = joinData?.player_ids || initPlayerIds;
+
+                    if (joinPlayerIds.length > 0) {
+                        playerIdsRef.current = joinPlayerIds;
+                    }
+
+                    // Determine role: room creator is host
+                    // Fallback: if no hostId available, first player in list is host
+                    const isHost = hostId
+                        ? userId === hostId
+                        : (playerIdsRef.current.length > 0 && userId === playerIdsRef.current[0]);
+                    roleRef.current = isHost ? 'host' : 'guest';
+
+                    console.log(`[CONTRA] Role: ${roleRef.current}, userId: ${userId}, hostId: ${hostId}`);
+
+                    setStatusText(isHost
+                        ? 'Waiting for player 2 to join...'
+                        : 'Connecting to host...');
+
                     // Listen for opponent joining
-                    usion.game.onPlayerJoined(() => {
+                    usion.game.onPlayerJoined((data: any) => {
+                        // Update player list from event
+                        if (data?.player_ids) {
+                            playerIdsRef.current = data.player_ids;
+                        }
+                        // If we didn't have hostId before, try from event
+                        if (!hostId && data?.host_id) {
+                            const eventIsHost = userId === data.host_id;
+                            roleRef.current = eventIsHost ? 'host' : 'guest';
+                            console.log(`[CONTRA] Role updated from event: ${roleRef.current}`);
+                        }
                         console.log('[CONTRA] Player joined, starting P2P connection');
                         startP2PConnection();
                     });
 
                     // If both players already in room, start immediately
-                    if (playerIds.length >= 2) {
+                    if (playerIdsRef.current.length >= 2) {
                         startP2PConnection();
                     }
                 })
@@ -109,6 +136,11 @@ export default function ContraPage() {
     // ─── P2P Connection ───────────────────────────────────────────────
 
     const startP2PConnection = useCallback(async () => {
+        if (p2pStartedRef.current) {
+            console.log('[CONTRA] P2P already started, skipping');
+            return;
+        }
+        p2pStartedRef.current = true;
         setPhase('connecting');
         setStatusText('Establishing P2P connection...');
 
@@ -132,6 +164,7 @@ export default function ContraPage() {
             rtcRef.current = rtc;
         } catch (err) {
             console.error('[CONTRA] P2P setup failed:', err);
+            p2pStartedRef.current = false; // Allow retry
             setStatusText('P2P connection failed');
             setPhase('disconnected');
         }
