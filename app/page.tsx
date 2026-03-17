@@ -53,6 +53,10 @@ export default function ContraPage() {
     const guestInputLoggedRef = useRef(false);
     const hostInputLoggedRef = useRef(false);
 
+    // Early signal buffer — captures signals before setupP2PConnection is called
+    const signalBufferRef = useRef<any[]>([]);
+    const signalDispatcherRef = useRef<((data: any) => void) | null>(null);
+
     // ─── SDK Initialization ───────────────────────────────────────────
 
     useEffect(() => {
@@ -75,6 +79,18 @@ export default function ContraPage() {
 
             setPhase('waiting');
             setStatusText('Connecting...');
+
+            // Register early signal handler BEFORE connect/join.
+            // This captures WebRTC signals that arrive before setupP2PConnection
+            // is called (fixes the race where host sends offer before guest is ready).
+            usion.game.onRealtime((data: any) => {
+                if (signalDispatcherRef.current) {
+                    signalDispatcherRef.current(data);
+                } else if (data?.action_type === 'signal') {
+                    console.log(`[CONTRA] Buffered early signal: ${data?.action_data?.type}`);
+                    signalBufferRef.current.push(data);
+                }
+            });
 
             // Connect to platform (Socket.IO) for signaling
             usion.game.connect()
@@ -168,6 +184,11 @@ export default function ContraPage() {
                     }
                 },
                 onLog: (msg) => console.log(`[SIGNAL] ${msg}`),
+                // Pass early signal buffer and subscription mechanism
+                earlySignals: signalBufferRef.current,
+                signalSubscribe: (handler) => {
+                    signalDispatcherRef.current = handler;
+                },
             });
 
             rtcRef.current = rtc;

@@ -8,7 +8,12 @@
  * ICE candidates are exchanged bidirectionally.
  *
  * IMPORTANT: Usion's onRealtime is a SETTER (overwrites previous handler),
- * so we use a single persistent handler with a pending-signal queue.
+ * so page.tsx registers the handler EARLY (before game.join) and passes
+ * a signalSubscribe function to avoid overwriting and losing signals.
+ *
+ * RACE CONDITION FIX: The host waits for a "guest_ready" signal before
+ * sending the offer. This ensures the guest's handler is registered.
+ * Signals that arrive before waitForSignal is called are buffered.
  */
 
 import { WebRTCManager, type P2PRole, type OnMessageCallback, type OnStateCallback } from './webrtc-manager';
@@ -22,6 +27,10 @@ interface SignalingConfig {
     onMessage: OnMessageCallback;
     onState: OnStateCallback;
     onLog?: (msg: string) => void;
+    /** Subscribe to signals from the early handler registered in page.tsx */
+    signalSubscribe?: (handler: (data: any) => void) => void;
+    /** Signals buffered before setupP2PConnection was called */
+    earlySignals?: any[];
 }
 
 /**
@@ -29,7 +38,7 @@ interface SignalingConfig {
  * Returns the WebRTCManager instance. Call destroy() when done.
  */
 export async function setupP2PConnection(config: SignalingConfig): Promise<WebRTCManager> {
-    const { role, onMessage, onState, onLog } = config;
+    const { role, onMessage, onState, onLog, signalSubscribe, earlySignals } = config;
     const log = onLog || (() => { });
 
     const usion = window.Usion;
@@ -52,7 +61,8 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
     rtc.onState = onState;
     rtc.init();
 
-    // Queue for waiting signals
+    // Internal signal buffer — holds signals that arrive before waitForSignal
+    const signalBuffer: any[] = [];
     let pendingResolve: ((payload: any) => void) | null = null;
     let pendingType: string | null = null;
 
@@ -62,12 +72,8 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
         usion.game.realtime('signal', { type: 'ice_candidate', candidate });
     };
 
-    // Single persistent handler — onRealtime is a SETTER, so we register only once
-    usion.game.onRealtime((data: any) => {
-        // Filter: only handle 'signal' action_type
-        if (data?.action_type !== 'signal') return;
-
-        const payload = data?.action_data || data;
+    // Process a signal payload (from early buffer or live handler)
+    const processSignal = (payload: any) => {
         if (!payload?.type) return;
 
         log(`Signal recv: ${payload.type}`);
@@ -78,25 +84,78 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
             return;
         }
 
-        // Resolve any pending waitForSignal
+        // Resolve any pending waitForSignal, or buffer for later
         if (pendingResolve && pendingType === payload.type) {
             const resolve = pendingResolve;
             pendingResolve = null;
             pendingType = null;
             resolve(payload);
+        } else {
+            signalBuffer.push(payload);
         }
-    });
+    };
 
-    const waitForSignal = (expectedType: string): Promise<any> => {
-        return new Promise((resolve) => {
+    // Raw handler for onRealtime events (extracts signal payload)
+    const handleRealtime = (data: any) => {
+        if (data?.action_type !== 'signal') return;
+        const payload = data?.action_data || data;
+        processSignal(payload);
+    };
+
+    // Subscribe to signals — prefer external subscription (from page.tsx early handler)
+    if (signalSubscribe) {
+        signalSubscribe(handleRealtime);
+    } else {
+        // Fallback: register directly (may miss signals if called late)
+        usion.game.onRealtime(handleRealtime);
+    }
+
+    // Drain any early-buffered signals
+    if (earlySignals && earlySignals.length > 0) {
+        log(`Processing ${earlySignals.length} early-buffered signals`);
+        for (const sig of earlySignals) {
+            handleRealtime(sig);
+        }
+        earlySignals.length = 0; // Clear the buffer
+    }
+
+    // Wait for a specific signal type, checking internal buffer first
+    const waitForSignal = (expectedType: string, timeoutMs = 15000): Promise<any> => {
+        // Check buffer first — signal may have already arrived
+        const idx = signalBuffer.findIndex(s => s.type === expectedType);
+        if (idx >= 0) {
+            log(`Found ${expectedType} in signal buffer`);
+            return Promise.resolve(signalBuffer.splice(idx, 1)[0]);
+        }
+
+        return new Promise((resolve, reject) => {
             pendingType = expectedType;
             pendingResolve = resolve;
+
+            // Timeout to prevent hanging forever
+            const timer = setTimeout(() => {
+                if (pendingResolve === resolve) {
+                    pendingResolve = null;
+                    pendingType = null;
+                    reject(new Error(`Timeout waiting for ${expectedType}`));
+                }
+            }, timeoutMs);
+
+            // Wrap resolve to clear timeout
+            const originalResolve = resolve;
+            pendingResolve = (payload) => {
+                clearTimeout(timer);
+                originalResolve(payload);
+            };
         });
     };
 
     if (role === 'host') {
-        // Host flow: create offer → send → wait for answer
-        log('Creating WebRTC offer...');
+        // Host flow: wait for guest ready → create offer → send → wait for answer
+        log('Waiting for guest ready signal...');
+        await waitForSignal('guest_ready');
+        log('Guest ready! Creating WebRTC offer...');
+
         const offer = await rtc.createOffer();
         usion.game.realtime('signal', { type: 'webrtc_offer', sdp: offer });
         log('Offer sent, waiting for answer...');
@@ -105,7 +164,10 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
         log('Answer received, connecting...');
         await rtc.handleAnswer(answerMsg.sdp);
     } else {
-        // Guest flow: wait for offer → create answer → send
+        // Guest flow: signal ready → wait for offer → create answer → send
+        log('Sending guest_ready signal...');
+        usion.game.realtime('signal', { type: 'guest_ready' });
+
         log('Waiting for WebRTC offer...');
         const offerMsg = await waitForSignal('webrtc_offer');
         log('Offer received, creating answer...');
