@@ -420,16 +420,16 @@ function drawWaveClear(ctx: CanvasRenderingContext2D, wave: number) {
 }
 
 function drawGameOver(ctx: CanvasRenderingContext2D, score: number, wave: number) {
-    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(0, 0, W, H);
 
     const victory = wave > 3; // Completed all waves
     ctx.fillStyle = victory ? '#f1c40f' : '#e74c3c';
     ctx.font = 'bold 20px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(victory ? 'VICTORY!' : 'GAME OVER', W / 2, H / 2 - 10);
+    ctx.fillText(victory ? 'VICTORY!' : 'GAME OVER', W / 2, H / 2 - 20);
 
     ctx.fillStyle = '#fff';
     ctx.font = '10px monospace';
-    ctx.fillText(`Score: ${score}  Wave: ${wave}`, W / 2, H / 2 + 12);
+    ctx.fillText(`Score: ${score}  Wave: ${wave}`, W / 2, H / 2);
 }

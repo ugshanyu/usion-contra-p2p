@@ -24,7 +24,7 @@ import { render } from "./renderer";
 declare global { interface Window { Usion?: any } }
 
 type Role = 'host' | 'guest';
-type Phase = 'loading' | 'waiting' | 'connecting' | 'playing' | 'disconnected';
+type Phase = 'loading' | 'waiting' | 'connecting' | 'playing' | 'gameover' | 'disconnected';
 
 const TICK_MS = 33; // ~30Hz
 const STATE_BROADCAST_MS = 33; // 30Hz state broadcast
@@ -47,8 +47,11 @@ export default function ContraPage() {
     const connectionInfoRef = useRef({ transport: 'P2P', rttMs: 0 });
     const p2pStartedRef = useRef(false);
     const tickHandleRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const inputSenderRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const rafRef = useRef<number>(0);
     const lastTickRef = useRef<number>(0);
+    const guestInputLoggedRef = useRef(false);
+    const hostInputLoggedRef = useRef(false);
 
     // ─── SDK Initialization ───────────────────────────────────────────
 
@@ -131,6 +134,7 @@ export default function ContraPage() {
 
         return () => {
             if (tickHandleRef.current) clearInterval(tickHandleRef.current);
+            if (inputSenderRef.current) clearInterval(inputSenderRef.current);
             if (rafRef.current) cancelAnimationFrame(rafRef.current);
             rtcRef.current?.destroy();
         };
@@ -153,6 +157,8 @@ export default function ContraPage() {
                 onMessage: handleP2PMessage,
                 onState: (state) => {
                     console.log(`[CONTRA] P2P state: ${state}`);
+                    // Set rtcRef as early as possible so callbacks can use it
+                    if (!rtcRef.current) rtcRef.current = rtc;
                     if (state === 'connected') {
                         connectionInfoRef.current.transport = 'P2P';
                         onP2PConnected();
@@ -175,26 +181,51 @@ export default function ContraPage() {
 
     // ─── P2P Connected — Start Game ───────────────────────────────────
 
-    const onP2PConnected = useCallback(() => {
+    const startGameSession = useCallback(() => {
         setPhase('playing');
         setStatusText('');
+        guestInputLoggedRef.current = false;
+        hostInputLoggedRef.current = false;
 
         if (roleRef.current === 'host') {
             // Host: initialize game state and start game loop
             const ids = playerIdsRef.current.length >= 2
                 ? playerIdsRef.current.slice(0, 2)
                 : [myIdRef.current, 'guest'];
+            console.log(`[CONTRA] Starting game as HOST with players: ${ids.join(', ')}`);
             gameStateRef.current = initState(ids);
 
             // Send initial player IDs to guest
             rtcRef.current?.send({ type: 'init', playerIds: ids });
 
             lastTickRef.current = performance.now();
+            if (tickHandleRef.current) clearInterval(tickHandleRef.current);
             tickHandleRef.current = setInterval(hostTick, TICK_MS);
+        } else {
+            console.log(`[CONTRA] Starting game as GUEST, sending input to host`);
         }
 
-        // Start render loop
-        renderLoop();
+        // Start guest input sender (reliable — not dependent on useEffect/phase)
+        if (roleRef.current === 'guest') {
+            if (inputSenderRef.current) clearInterval(inputSenderRef.current);
+            inputSenderRef.current = setInterval(() => {
+                if (rtcRef.current?.connected) {
+                    const keys = { ...keysRef.current };
+                    if (!guestInputLoggedRef.current) {
+                        console.log(`[CONTRA] Guest sending first input:`, JSON.stringify(keys));
+                        guestInputLoggedRef.current = true;
+                    }
+                    rtcRef.current.send({ type: 'input', keys });
+                }
+            }, TICK_MS);
+        }
+
+        // Start render loop (only if not already running)
+        if (!rafRef.current) renderLoop();
+    }, []);
+
+    const onP2PConnected = useCallback(() => {
+        startGameSession();
     }, []);
 
     // ─── Host Game Loop ───────────────────────────────────────────────
@@ -219,8 +250,12 @@ export default function ContraPage() {
 
         // Check game over
         if (isTerminal(gameStateRef.current)) {
+            console.log(`[CONTRA] Game over! Score: ${gameStateRef.current.score}, Wave: ${gameStateRef.current.wave}`);
             if (tickHandleRef.current) clearInterval(tickHandleRef.current);
             tickHandleRef.current = null;
+            // Send final state + game_over event
+            rtcRef.current?.send({ type: 'game_over', score: gameStateRef.current.score, wave: gameStateRef.current.wave });
+            setPhase('gameover');
         }
     }, []);
 
@@ -231,23 +266,68 @@ export default function ContraPage() {
             // Host receives guest's input
             if (msg.type === 'input') {
                 if (gameStateRef.current) {
-                    // Find the guest player in game state (not playerIdsRef,
-                    // which may have the real ID while state uses fallback 'guest')
                     const guestId = Object.keys(gameStateRef.current.players).find(
                         id => id !== myIdRef.current
                     );
+                    if (!hostInputLoggedRef.current && guestId) {
+                        console.log(`[CONTRA] Host received first guest input for player: ${guestId}`, JSON.stringify(msg.keys));
+                        hostInputLoggedRef.current = true;
+                    }
                     if (guestId) {
                         applyInput(gameStateRef.current, guestId, msg.keys);
                     }
                 }
+            } else if (msg.type === 'restart_request') {
+                console.log('[CONTRA] Guest requested restart');
+                handleRestart();
             }
         } else {
             // Guest receives game state from host
             if (msg.type === 'state') {
                 networkStateRef.current = msg;
+                // Detect game over from state
+                if (msg.phase === 'game_over') {
+                    setPhase('gameover');
+                }
             } else if (msg.type === 'init') {
+                console.log(`[CONTRA] Guest received init, playerIds: ${msg.playerIds?.join(', ')}`);
                 playerIdsRef.current = msg.playerIds;
+            } else if (msg.type === 'game_over') {
+                console.log(`[CONTRA] Game over received: score=${msg.score}, wave=${msg.wave}`);
+                setPhase('gameover');
+            } else if (msg.type === 'restart') {
+                console.log('[CONTRA] Host restarted the game');
+                networkStateRef.current = null;
+                setPhase('playing');
             }
+        }
+    }, []);
+
+    // ─── Restart Logic ───────────────────────────────────────────────
+
+    const handleRestart = useCallback(() => {
+        if (roleRef.current === 'host') {
+            console.log('[CONTRA] Restarting game as host');
+            // Re-initialize game state
+            const ids = playerIdsRef.current.length >= 2
+                ? playerIdsRef.current.slice(0, 2)
+                : [myIdRef.current, 'guest'];
+            gameStateRef.current = initState(ids);
+
+            // Notify guest of restart
+            rtcRef.current?.send({ type: 'restart' });
+            rtcRef.current?.send({ type: 'init', playerIds: ids });
+
+            // Restart game loop
+            lastTickRef.current = performance.now();
+            if (tickHandleRef.current) clearInterval(tickHandleRef.current);
+            tickHandleRef.current = setInterval(hostTick, TICK_MS);
+
+            setPhase('playing');
+        } else {
+            // Guest requests restart from host
+            console.log('[CONTRA] Requesting restart from host');
+            rtcRef.current?.send({ type: 'restart_request' });
         }
     }, []);
 
@@ -273,20 +353,6 @@ export default function ContraPage() {
 
         rafRef.current = requestAnimationFrame(renderLoop);
     }, []);
-
-    // ─── Guest Input Sender ───────────────────────────────────────────
-
-    useEffect(() => {
-        if (roleRef.current !== 'guest') return;
-
-        const interval = setInterval(() => {
-            if (rtcRef.current?.connected) {
-                rtcRef.current.send({ type: 'input', keys: { ...keysRef.current } });
-            }
-        }, TICK_MS);
-
-        return () => clearInterval(interval);
-    }, [phase]);
 
     // ─── Keyboard Input ───────────────────────────────────────────────
 
@@ -333,24 +399,9 @@ export default function ContraPage() {
         return () => window.removeEventListener('resize', resize);
     }, []);
 
-    // ─── Touch Controls ───────────────────────────────────────────────
+    // ─── Touch Controls (native listeners for non-passive) ────────────
 
-    const handleTouchStart = useCallback((e: React.TouchEvent) => {
-        e.preventDefault();
-        updateTouches(e.touches);
-    }, []);
-
-    const handleTouchMove = useCallback((e: React.TouchEvent) => {
-        e.preventDefault();
-        updateTouches(e.touches);
-    }, []);
-
-    const handleTouchEnd = useCallback((e: React.TouchEvent) => {
-        e.preventDefault();
-        updateTouches(e.touches);
-    }, []);
-
-    const updateTouches = useCallback((touches: React.TouchList | TouchList) => {
+    const updateTouches = useCallback((touches: TouchList) => {
         const w = window.innerWidth;
         const h = window.innerHeight;
 
@@ -387,6 +438,26 @@ export default function ContraPage() {
         }
     }, []);
 
+    // Register native touch listeners (non-passive) to allow preventDefault
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        const onTouchStart = (e: TouchEvent) => { e.preventDefault(); updateTouches(e.touches); };
+        const onTouchMove = (e: TouchEvent) => { e.preventDefault(); updateTouches(e.touches); };
+        const onTouchEnd = (e: TouchEvent) => { e.preventDefault(); updateTouches(e.touches); };
+
+        canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+        canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+        canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+
+        return () => {
+            canvas.removeEventListener('touchstart', onTouchStart);
+            canvas.removeEventListener('touchmove', onTouchMove);
+            canvas.removeEventListener('touchend', onTouchEnd);
+        };
+    }, []);
+
     // ─── Render ───────────────────────────────────────────────────────
 
     return (
@@ -397,13 +468,10 @@ export default function ContraPage() {
             <canvas
                 ref={canvasRef}
                 style={{ display: 'block', width: '100%', height: '100%' }}
-                onTouchStart={handleTouchStart}
-                onTouchMove={handleTouchMove}
-                onTouchEnd={handleTouchEnd}
             />
 
-            {/* Status overlay */}
-            {phase !== 'playing' && (
+            {/* Status overlay (loading/waiting/connecting) */}
+            {phase !== 'playing' && phase !== 'gameover' && (
                 <div style={{
                     position: 'absolute', inset: 0,
                     display: 'flex', flexDirection: 'column',
@@ -430,8 +498,43 @@ export default function ContraPage() {
                 </div>
             )}
 
+            {/* Game Over overlay with restart */}
+            {phase === 'gameover' && (
+                <div style={{
+                    position: 'absolute', inset: 0,
+                    display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center',
+                    background: 'rgba(0,0,0,0.6)', color: '#fff',
+                    fontFamily: 'monospace',
+                }}>
+                    <button
+                        onClick={handleRestart}
+                        style={{
+                            marginTop: 60,
+                            padding: '12px 32px',
+                            background: '#e74c3c',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: 6,
+                            fontSize: 16,
+                            fontFamily: 'monospace',
+                            fontWeight: 'bold',
+                            cursor: 'pointer',
+                            letterSpacing: 2,
+                        }}
+                    >
+                        {roleRef.current === 'host' ? 'RESTART' : 'REQUEST RESTART'}
+                    </button>
+                    <div style={{ fontSize: 10, opacity: 0.5, marginTop: 8 }}>
+                        {roleRef.current === 'host'
+                            ? 'Press to start a new game'
+                            : 'Ask host to restart the game'}
+                    </div>
+                </div>
+            )}
+
             {/* Touch control hints (mobile) */}
-            {phase === 'playing' && (
+            {(phase === 'playing' || phase === 'gameover') && (
                 <>
                     {/* Left: D-pad zone hint */}
                     <div style={{
