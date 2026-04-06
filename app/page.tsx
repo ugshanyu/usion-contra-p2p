@@ -145,6 +145,26 @@ export default function ContraPage() {
                         startP2PConnection();
                     });
 
+                    // Listen for opponent leaving — preserve game state for rejoin
+                    usion.game.onPlayerLeft((data: any) => {
+                        const leftId = data?.player_id;
+                        console.log(`[CONTRA] Player left: ${leftId}`);
+
+                        // Update player IDs (drop the leaver)
+                        if (data?.player_ids) {
+                            playerIdsRef.current = data.player_ids;
+                        } else if (leftId) {
+                            playerIdsRef.current = playerIdsRef.current.filter((id) => id !== leftId);
+                        }
+
+                        cleanupP2PForRejoin();
+
+                        // Game state on host is preserved in gameStateRef so a
+                        // new player can rejoin and resume mid-wave.
+                        setPhase('waiting');
+                        setStatusText('Opponent left. Waiting for another player...');
+                    });
+
                     // Only start P2P if the other player is ALREADY connected
                     // to the socket room (connected_count reflects live sockets,
                     // not just MongoDB membership). This avoids sending an offer
@@ -173,6 +193,31 @@ export default function ContraPage() {
 
     // ─── P2P Connection ───────────────────────────────────────────────
 
+    /**
+     * Tear down the active P2P session so a new player can join and
+     * re-establish the WebRTC channel. Game state on the host is
+     * intentionally preserved in `gameStateRef` so the rejoining player
+     * can resume mid-wave (mirrors XO's `waiting_rejoin` flow).
+     */
+    const cleanupP2PForRejoin = useCallback(() => {
+        // Pause loops
+        if (tickHandleRef.current) {
+            clearInterval(tickHandleRef.current);
+            tickHandleRef.current = null;
+        }
+        if (inputSenderRef.current) {
+            clearInterval(inputSenderRef.current);
+            inputSenderRef.current = null;
+        }
+        // Tear down WebRTC so a fresh connection can be negotiated
+        try { rtcRef.current?.destroy(); } catch { /* ignore */ }
+        rtcRef.current = null;
+        p2pStartedRef.current = false;
+        // Clear stale signals from the departed peer
+        signalBufferRef.current = [];
+        signalDispatcherRef.current = null;
+    }, []);
+
     const startP2PConnection = useCallback(async () => {
         if (p2pStartedRef.current) {
             console.log('[CONTRA] P2P already started, skipping');
@@ -194,8 +239,13 @@ export default function ContraPage() {
                         connectionInfoRef.current.transport = 'P2P';
                         onP2PConnected();
                     } else if (state === 'disconnected' || state === 'failed') {
-                        setPhase('disconnected');
-                        setStatusText('Connection lost');
+                        // Drop into the same waiting flow as onPlayerLeft so a
+                        // new peer can re-establish the connection. Usion's
+                        // onPlayerLeft will fire shortly after — both calls
+                        // are idempotent.
+                        cleanupP2PForRejoin();
+                        setPhase('waiting');
+                        setStatusText('Opponent disconnected. Waiting for another player...');
                     }
                 },
                 onLog: (msg) => console.log(`[SIGNAL] ${msg}`),
@@ -230,21 +280,51 @@ export default function ContraPage() {
         }, 100);
 
         if (roleRef.current === 'host') {
-            // Host: initialize game state and start game loop
+            // Host: initialize OR resume game state and start the game loop
             const ids = playerIdsRef.current.length >= 2
                 ? playerIdsRef.current.slice(0, 2)
                 : [myIdRef.current, 'guest'];
-            console.log(`[CONTRA] Starting game as HOST with players: ${ids.join(', ')}`);
-            gameStateRef.current = initState(ids);
 
-            // Debug: verify game state
-            const ps = Object.entries(gameStateRef.current.players);
-            console.log(`[CONTRA] Game state initialized: ${ps.length} players, phase=${gameStateRef.current.phase}`);
-            for (const [id, p] of ps) {
-                console.log(`[CONTRA]   Player ${id}: hp=${p.hp}, alive=${p.alive}, pos=(${p.x},${p.y})`);
+            const existingState = gameStateRef.current;
+            const isRejoin = !!existingState && !isTerminal(existingState);
+
+            if (isRejoin && existingState) {
+                // Reuse the in-progress game and rebind the guest slot to
+                // whichever player is now in the room. The leaving player's
+                // record is replaced wholesale so the new arrival starts
+                // fresh (lives, position, powerups) without resetting the
+                // host's progress, score, wave, or enemies.
+                const newGuestId = ids.find((id) => id !== myIdRef.current);
+                const oldGuestId = Object.keys(existingState.players).find((id) => id !== myIdRef.current);
+                if (newGuestId && oldGuestId && oldGuestId !== newGuestId) {
+                    delete existingState.players[oldGuestId];
+                }
+                if (newGuestId && !existingState.players[newGuestId]) {
+                    // Spawn the new guest near the host so they can catch up
+                    const host = existingState.players[myIdRef.current];
+                    existingState.players[newGuestId] = {
+                        id: newGuestId,
+                        x: host ? host.x + 16 : 90,
+                        y: host ? host.y : 139,
+                        vx: 0, vy: 0, dir: 1, grounded: true,
+                        hp: 3, alive: true, invincibleMs: 2000,
+                        powerup: null, fireCooldownMs: 0, anim: 'idle',
+                        input: { left: false, right: false, up: false, down: false, jump: false, fire: false },
+                    };
+                }
+                console.log(`[CONTRA] Resuming game as HOST after rejoin (wave=${existingState.wave}, score=${existingState.score})`);
+            } else {
+                console.log(`[CONTRA] Starting game as HOST with players: ${ids.join(', ')}`);
+                gameStateRef.current = initState(ids);
+                // Debug: verify game state
+                const ps = Object.entries(gameStateRef.current.players);
+                console.log(`[CONTRA] Game state initialized: ${ps.length} players, phase=${gameStateRef.current.phase}`);
+                for (const [id, p] of ps) {
+                    console.log(`[CONTRA]   Player ${id}: hp=${p.hp}, alive=${p.alive}, pos=(${p.x},${p.y})`);
+                }
             }
 
-            // Send initial player IDs to guest
+            // Send (re-)initial player IDs to guest so it can identify itself
             rtcRef.current?.send({ type: 'init', playerIds: ids });
 
             lastTickRef.current = performance.now();
