@@ -154,25 +154,39 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
     };
 
     if (role === 'host') {
-        // Host flow: create offer immediately → send → wait for answer.
-        // The guest's early signal buffer (in page.tsx) catches the offer
-        // whether or not the guest is already inside setupP2PConnection.
+        // Host flow: create offer → broadcast it on a heartbeat → wait for
+        // answer. The first offer often races the guest's room subscription
+        // (or the guest's onRealtime handler registration). Re-sending the
+        // SAME SDP every 1.5s is safe — the guest only acts on the first
+        // one it sees, and our processSignal short-circuits duplicates by
+        // resolving the pending wait the first time it arrives.
         log('Creating WebRTC offer...');
         const offer = await rtc.createOffer();
-        usion.game.realtime('signal', { type: 'webrtc_offer', sdp: offer });
+        const sendOffer = () => {
+            try {
+                usion.game.realtime('signal', { type: 'webrtc_offer', sdp: offer });
+            } catch { /* ignore */ }
+        };
+        sendOffer();
         log('Offer sent, waiting for answer...');
+        const offerHeartbeat = setInterval(sendOffer, 1500);
 
-        const answerMsg = await waitForSignal('webrtc_answer');
+        let answerMsg: any;
+        try {
+            answerMsg = await waitForSignal('webrtc_answer', 20000);
+        } finally {
+            clearInterval(offerHeartbeat);
+        }
         log('Answer received, connecting...');
         await rtc.handleAnswer(answerMsg.sdp);
     } else {
-        // Guest flow: wait for offer → create answer → send.
-        // We also send a `guest_ready` ping every 1.5s as a heartbeat the
-        // host can use to confirm the room is live; the host doesn't block
-        // on it, but it gives operators a clear "guest is alive" signal in
-        // the logs and helps wake up sticky relays.
+        // Guest flow: wait for offer → create answer → broadcast it on a
+        // heartbeat until the host's WebRTC connection state flips to
+        // 'connected'. We also send a `guest_ready` ping every 1.5s as a
+        // tiny heartbeat the host can use to confirm the room is live and
+        // to help wake up sticky relays.
         log('Waiting for WebRTC offer...');
-        const heartbeat = setInterval(() => {
+        const guestReadyHeartbeat = setInterval(() => {
             try { usion.game.realtime('signal', { type: 'guest_ready' }); } catch { /* ignore */ }
         }, 1500);
         // Send one immediately
@@ -180,15 +194,32 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
 
         let offerMsg: any;
         try {
-            offerMsg = await waitForSignal('webrtc_offer', 12000);
+            offerMsg = await waitForSignal('webrtc_offer', 30000);
         } finally {
-            clearInterval(heartbeat);
+            clearInterval(guestReadyHeartbeat);
         }
         log('Offer received, creating answer...');
 
         const answer = await rtc.handleOffer(offerMsg.sdp);
-        usion.game.realtime('signal', { type: 'webrtc_answer', sdp: answer });
+        const sendAnswer = () => {
+            try {
+                usion.game.realtime('signal', { type: 'webrtc_answer', sdp: answer });
+            } catch { /* ignore */ }
+        };
+        sendAnswer();
         log('Answer sent, connecting...');
+        // Re-broadcast the answer until the data channel is open. The host
+        // signals completion via rtc.connected (DataChannel onopen).
+        const answerHeartbeat = setInterval(() => {
+            if (rtc.connected) {
+                clearInterval(answerHeartbeat);
+                return;
+            }
+            sendAnswer();
+        }, 1500);
+        // Safety stop after 20s — by then either the connection is up or
+        // the WebRTC stack has given up.
+        setTimeout(() => clearInterval(answerHeartbeat), 20000);
     }
 
     return rtc;
