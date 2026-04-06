@@ -60,13 +60,26 @@ export default function ContraPage() {
     // ─── SDK Initialization ───────────────────────────────────────────
 
     useEffect(() => {
-        const usion = window.Usion;
-        if (!usion) {
-            setStatusText('Usion SDK not found');
-            return;
-        }
+        let cancelled = false;
 
-        usion.init((config: any) => {
+        // Dynamically load the Usion SDK (npm package). The browser entry
+        // attaches `window.Usion` as a side effect, matching the legacy
+        // `<script src="/usion-sdk.js">` behavior used elsewhere.
+        import('@usions/sdk/browser').then(() => {
+            if (cancelled) return;
+            const usion = window.Usion;
+            if (!usion) {
+                setStatusText('Usion SDK not found');
+                return;
+            }
+            initWithSdk(usion);
+        }).catch((err) => {
+            console.error('[CONTRA] Failed to load Usion SDK:', err);
+            setStatusText('Failed to load Usion SDK');
+        });
+
+        function initWithSdk(usion: any) {
+            usion.init((config: any) => {
             const userId = usion.user?.getId?.() || config.userId || 'unknown';
             const roomId = config.roomId;
             const initHostId = config.hostId || config.host_id;
@@ -147,8 +160,10 @@ export default function ContraPage() {
                     setStatusText('Connection failed');
                 });
         });
+        }
 
         return () => {
+            cancelled = true;
             if (tickHandleRef.current) clearInterval(tickHandleRef.current);
             if (inputSenderRef.current) clearInterval(inputSenderRef.current);
             if (rafRef.current) cancelAnimationFrame(rafRef.current);
