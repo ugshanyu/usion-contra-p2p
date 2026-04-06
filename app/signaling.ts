@@ -11,9 +11,12 @@
  * so page.tsx registers the handler EARLY (before game.join) and passes
  * a signalSubscribe function to avoid overwriting and losing signals.
  *
- * RACE CONDITION FIX: The host waits for a "guest_ready" signal before
- * sending the offer. This ensures the guest's handler is registered.
- * Signals that arrive before waitForSignal is called are buffered.
+ * RACE PROTECTION: Both the early signal buffer in page.tsx and the
+ * internal signal buffer here capture signals that arrive before the
+ * dispatcher is wired up. The host sends its offer immediately and
+ * the guest's early buffer catches it whether or not the guest's
+ * handler is already registered. Retries are handled by the caller
+ * (`startP2PConnection` in page.tsx).
  */
 
 import { WebRTCManager, type P2PRole, type OnMessageCallback, type OnStateCallback } from './webrtc-manager';
@@ -120,7 +123,7 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
     }
 
     // Wait for a specific signal type, checking internal buffer first
-    const waitForSignal = (expectedType: string, timeoutMs = 15000): Promise<any> => {
+    const waitForSignal = (expectedType: string, timeoutMs = 8000): Promise<any> => {
         // Check buffer first — signal may have already arrived
         const idx = signalBuffer.findIndex(s => s.type === expectedType);
         if (idx >= 0) {
@@ -151,11 +154,10 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
     };
 
     if (role === 'host') {
-        // Host flow: wait for guest ready → create offer → send → wait for answer
-        log('Waiting for guest ready signal...');
-        await waitForSignal('guest_ready');
-        log('Guest ready! Creating WebRTC offer...');
-
+        // Host flow: create offer immediately → send → wait for answer.
+        // The guest's early signal buffer (in page.tsx) catches the offer
+        // whether or not the guest is already inside setupP2PConnection.
+        log('Creating WebRTC offer...');
         const offer = await rtc.createOffer();
         usion.game.realtime('signal', { type: 'webrtc_offer', sdp: offer });
         log('Offer sent, waiting for answer...');
@@ -164,12 +166,24 @@ export async function setupP2PConnection(config: SignalingConfig): Promise<WebRT
         log('Answer received, connecting...');
         await rtc.handleAnswer(answerMsg.sdp);
     } else {
-        // Guest flow: signal ready → wait for offer → create answer → send
-        log('Sending guest_ready signal...');
-        usion.game.realtime('signal', { type: 'guest_ready' });
-
+        // Guest flow: wait for offer → create answer → send.
+        // We also send a `guest_ready` ping every 1.5s as a heartbeat the
+        // host can use to confirm the room is live; the host doesn't block
+        // on it, but it gives operators a clear "guest is alive" signal in
+        // the logs and helps wake up sticky relays.
         log('Waiting for WebRTC offer...');
-        const offerMsg = await waitForSignal('webrtc_offer');
+        const heartbeat = setInterval(() => {
+            try { usion.game.realtime('signal', { type: 'guest_ready' }); } catch { /* ignore */ }
+        }, 1500);
+        // Send one immediately
+        try { usion.game.realtime('signal', { type: 'guest_ready' }); } catch { /* ignore */ }
+
+        let offerMsg: any;
+        try {
+            offerMsg = await waitForSignal('webrtc_offer', 12000);
+        } finally {
+            clearInterval(heartbeat);
+        }
         log('Offer received, creating answer...');
 
         const answer = await rtc.handleOffer(offerMsg.sdp);

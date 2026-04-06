@@ -227,41 +227,59 @@ export default function ContraPage() {
         setPhase('connecting');
         setStatusText('Establishing P2P connection...');
 
-        try {
-            const rtc = await setupP2PConnection({
-                role: roleRef.current,
-                onMessage: handleP2PMessage,
-                onState: (state) => {
-                    console.log(`[CONTRA] P2P state: ${state}`);
-                    // Set rtcRef as early as possible so callbacks can use it
-                    if (!rtcRef.current) rtcRef.current = rtc;
-                    if (state === 'connected') {
-                        connectionInfoRef.current.transport = 'P2P';
-                        onP2PConnected();
-                    } else if (state === 'disconnected' || state === 'failed') {
-                        // Drop into the same waiting flow as onPlayerLeft so a
-                        // new peer can re-establish the connection. Usion's
-                        // onPlayerLeft will fire shortly after — both calls
-                        // are idempotent.
-                        cleanupP2PForRejoin();
-                        setPhase('waiting');
-                        setStatusText('Opponent disconnected. Waiting for another player...');
-                    }
-                },
-                onLog: (msg) => console.log(`[SIGNAL] ${msg}`),
-                // Pass early signal buffer and subscription mechanism
-                earlySignals: signalBufferRef.current,
-                signalSubscribe: (handler) => {
-                    signalDispatcherRef.current = handler;
-                },
-            });
+        const MAX_ATTEMPTS = 6;
+        const RETRY_DELAY_MS = 1500;
 
-            rtcRef.current = rtc;
-        } catch (err) {
-            console.error('[CONTRA] P2P setup failed:', err);
-            p2pStartedRef.current = false; // Allow retry
-            setStatusText('P2P connection failed');
-            setPhase('disconnected');
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                console.log(`[CONTRA] P2P attempt ${attempt}/${MAX_ATTEMPTS}`);
+                const rtc = await setupP2PConnection({
+                    role: roleRef.current,
+                    onMessage: handleP2PMessage,
+                    onState: (state) => {
+                        console.log(`[CONTRA] P2P state: ${state}`);
+                        // Set rtcRef as early as possible so callbacks can use it
+                        if (!rtcRef.current) rtcRef.current = rtc;
+                        if (state === 'connected') {
+                            connectionInfoRef.current.transport = 'P2P';
+                            onP2PConnected();
+                        } else if (state === 'disconnected' || state === 'failed') {
+                            // Drop into the same waiting flow as onPlayerLeft so a
+                            // new peer can re-establish the connection. Usion's
+                            // onPlayerLeft will fire shortly after — both calls
+                            // are idempotent.
+                            cleanupP2PForRejoin();
+                            setPhase('waiting');
+                            setStatusText('Opponent disconnected. Waiting for another player...');
+                        }
+                    },
+                    onLog: (msg) => console.log(`[SIGNAL] ${msg}`),
+                    // Pass early signal buffer and subscription mechanism
+                    earlySignals: signalBufferRef.current,
+                    signalSubscribe: (handler) => {
+                        signalDispatcherRef.current = handler;
+                    },
+                });
+
+                rtcRef.current = rtc;
+                return; // success
+            } catch (err) {
+                console.error(`[CONTRA] P2P setup failed (attempt ${attempt}/${MAX_ATTEMPTS}):`, err);
+                // Tear down any partially-built WebRTC before retrying
+                try { rtcRef.current?.destroy(); } catch { /* ignore */ }
+                rtcRef.current = null;
+                // Reset signaling subscription so the next attempt can re-bind
+                signalDispatcherRef.current = null;
+
+                if (attempt >= MAX_ATTEMPTS) {
+                    p2pStartedRef.current = false;
+                    setStatusText('Connection failed. Please refresh the page.');
+                    setPhase('disconnected');
+                    return;
+                }
+                setStatusText(`Retrying P2P connection (${attempt}/${MAX_ATTEMPTS})...`);
+                await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+            }
         }
     }, []);
 
